@@ -13,12 +13,20 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import aiohttp
 import zipfile
 
+# ---- SSL CSR/Key generation ----
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 CF_API = "https://api.cloudflare.com/client/v4"
 
-# ========== Utils ==========
+# =========================
+# Utils
+# =========================
 def normalize_domain(d: str) -> str:
     d = (d or "").strip().strip(".").lower()
     d = re.sub(r"^https?://", "", d)
@@ -44,7 +52,9 @@ async def cf(session: aiohttp.ClientSession, method: str, url: str, token: str, 
             data = {"raw": txt}
         return r.status, data
 
-# ========== Zone ==========
+# =========================
+# Zone
+# =========================
 async def get_accounts(session, token):
     st, data = await cf(session, "GET", f"{CF_API}/accounts", token)
     if st != 200:
@@ -65,7 +75,6 @@ async def find_zone(session, token, domain: str):
     return None, None
 
 async def create_zone(session, token, domain: str):
-    # Luôn kèm account.id để tạo zone trong account hiện tại
     acct_id = (await get_accounts(session, token))[0]["id"]
     payload = {"name": domain, "type": "full", "jump_start": False, "account": {"id": acct_id}}
     st, data = await cf(session, "POST", f"{CF_API}/zones", token, data=json.dumps(payload))
@@ -82,15 +91,19 @@ async def get_zone(session, token, zone_id: str):
 def extract_nameservers(zone_obj: dict):
     return list(zone_obj.get("vanity_name_servers") or zone_obj.get("name_servers") or [])
 
-# ========== DNS ==========
+# =========================
+# DNS
+# =========================
 async def list_dns_records(session, token, zone_id: str):
     all_items = []
     page = 1
     per_page = 500
     while True:
-        st, data = await cf(session, "GET",
-                            f"{CF_API}/zones/{zone_id}/dns_records?per_page={per_page}&page={page}",
-                            token)
+        st, data = await cf(
+            session, "GET",
+            f"{CF_API}/zones/{zone_id}/dns_records?per_page={per_page}&page={page}",
+            token
+        )
         if st != 200:
             raise RuntimeError(f"List DNS thất bại ({st}): {data}")
         items = data.get("result") or []
@@ -111,8 +124,8 @@ async def delete_all_dns_records(session, token, zone_id: str) -> int:
         if st not in (200, 204):
             raise RuntimeError(f"Xoá record {rid} thất bại ({st}): {data}")
         deleted += 1
-        await asyncio.sleep(0.05)
-    # verify empty
+        await asyncio.sleep(0.04)
+    # verify rỗng
     left = await list_dns_records(session, token, zone_id)
     if left:
         names = [f"{x['type']} {x['name']}" for x in left]
@@ -133,20 +146,50 @@ async def create_cname_www(session, token, zone_id: str, domain: str):
         raise RuntimeError(f"Tạo CNAME www thất bại ({st}): {data}")
     return data["result"]["id"]
 
-# ========== Origin CA (SSL) ==========
+# =========================
+# Origin CA (generate CSR locally, send to API)
+# =========================
+def gen_key_and_csr(domain: str):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    csr_builder = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName(domain),
+                x509.DNSName(f"*.{domain}")
+            ]),
+            critical=False
+        )
+    )
+    csr = csr_builder.sign(key, hashes.SHA256())
+    private_key_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption()
+    ).decode()
+    csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode()
+    return private_key_pem, csr_pem
+
 async def create_origin_cert(session, token, domain: str):
-    # Endpoint đúng của Origin CA: KHÔNG theo /zones
+    private_key_pem, csr_pem = gen_key_and_csr(domain)
     payload = {
+        "csr": csr_pem,
         "hostnames": [domain, f"*.{domain}"],
         "request_type": "origin-rsa",
         "requested_validity": 3650
     }
     st, data = await cf(session, "POST", f"{CF_API}/certificates", token, data=json.dumps(payload))
-    if st not in (200, 201):
+    if st not in (200, 201) or not isinstance(data, dict) or not data.get("success"):
         raise RuntimeError(f"Tạo SSL thất bại ({st}): {data}")
-    return data["result"]
+    cert = (data.get("result") or {}).get("certificate")
+    if not cert:
+        raise RuntimeError(f"Tạo SSL: không thấy trường 'certificate' trong phản hồi: {data}")
+    return {"certificate": cert, "private_key": private_key_pem}
 
-# ========== Per-row: đúng thứ tự yêu cầu ==========
+# =========================
+# Per-row flow (đúng thứ tự yêu cầu)
+# =========================
 async def process_row(session, row: dict) -> dict:
     domain_raw = str(row.get("domain", "")).strip()
     ip_raw = str(row.get("ip_server", "")).strip()
@@ -162,17 +205,18 @@ async def process_row(session, row: dict) -> dict:
         return {"domain": domain, "ok": False, "error": str(e)}
 
     try:
-        # 1) ADD ZONE (find or create)
+        # 1) KIỂM TRA ZONE: nếu đã có -> dùng luôn; nếu chưa có -> tạo mới
         zone_id, zone_obj = await find_zone(session, token, domain)
         if not zone_id:
             zone_id, zone_obj = await create_zone(session, token, domain)
 
-        # 2) DELETE ALL RECORDS (verify empty)
+        # 2) XOÁ TOÀN BỘ DNS
         await delete_all_dns_records(session, token, zone_id)
 
-        # 3) ADD RECORDS (A @, CNAME www) + verify
+        # 3) THÊM RECORD: A @ và CNAME www
         a_id = await create_a_apex(session, token, zone_id, domain, ip)
         c_id = await create_cname_www(session, token, zone_id, domain)
+        # verify
         cur = await list_dns_records(session, token, zone_id)
         need = {("A", domain), ("CNAME", f"www.{domain}")}
         have = {(x["type"], x["name"]) for x in cur}
@@ -184,7 +228,7 @@ async def process_row(session, row: dict) -> dict:
         zone_obj = await get_zone(session, token, zone_id)
         ns_list = extract_nameservers(zone_obj)
 
-        # 5) CREATE SSL (Origin CA)
+        # 5) TẠO ORIGIN CA CERT (tự sinh key+CSR, gửi CSR lên)
         cert_obj = await create_origin_cert(session, token, domain)
 
         return {
@@ -200,10 +244,12 @@ async def process_row(session, row: dict) -> dict:
     except Exception as e:
         return {"domain": domain, "ok": False, "error": str(e), "nameservers": [], "certificate": "", "private_key": ""}
 
-# ========== Telegram ==========
+# =========================
+# Telegram bot
+# =========================
 START_TEXT = (
     "Gửi Excel (.xlsx): domain, ip_server, cloudflare_token.\n"
-    "Quy trình: ADD ZONE → XOÁ TOÀN BỘ RECORD → THÊM RECORD → LẤY NAMESERVER → TẠO SSL (Origin CA)."
+    "Quy trình: KIỂM TRA/THÊM ZONE → XOÁ TẤT CẢ RECORD → THÊM A @ & CNAME www → LẤY NAMESERVER → TẠO ORIGIN CA (RSA/10y)."
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,7 +297,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     results = []
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=240)) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=300)) as session:
         for _, row in df.iterrows():
             row_dict = {k: ("" if pd.isna(v) else str(v)) for k, v in row.items()}
             res = await process_row(session, row_dict)
@@ -273,7 +319,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
-                # Gửi ZIP key + cert
+                # ZIP key + cert
                 zip_buffer = BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w") as z:
                     z.writestr(f"{res['domain']}.key", priv_key)
