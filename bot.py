@@ -1,3 +1,4 @@
+# main.py
 import asyncio
 import os
 import re
@@ -149,6 +150,8 @@ async def create_cname_www(session, token, zone_id: str, domain: str):
 # =========================
 # Origin CA (generate CSR locally, send to API)
 # =========================
+DEFAULT_VALIDITY_DAYS = 5475  # hợp lệ theo CF: 7, 30, 90, 365, 730, 1095, 5475
+
 def gen_key_and_csr(domain: str):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     csr_builder = (
@@ -173,18 +176,35 @@ def gen_key_and_csr(domain: str):
 
 async def create_origin_cert(session, token, domain: str):
     private_key_pem, csr_pem = gen_key_and_csr(domain)
+
+    # Cloudflare Origin CA — correct endpoint per docs:
+    # POST https://api.cloudflare.com/client/v4/certificates
     payload = {
         "csr": csr_pem,
         "hostnames": [domain, f"*.{domain}"],
         "request_type": "origin-rsa",
-        "requested_validity": 3650
+        "requested_validity": DEFAULT_VALIDITY_DAYS
     }
     st, data = await cf(session, "POST", f"{CF_API}/certificates", token, data=json.dumps(payload))
+
+    # fallback: nếu server vẫn trả 1009, thử bỏ requested_validity để dùng mặc định 5475
+    def has_err(d, code):
+        try:
+            return any(e.get("code") == code for e in d.get("errors", []))
+        except Exception:
+            return False
+
+    if st == 400 and isinstance(data, dict) and has_err(data, 1009):
+        payload.pop("requested_validity", None)
+        st, data = await cf(session, "POST", f"{CF_API}/certificates", token, data=json.dumps(payload))
+
     if st not in (200, 201) or not isinstance(data, dict) or not data.get("success"):
         raise RuntimeError(f"Tạo SSL thất bại ({st}): {data}")
+
     cert = (data.get("result") or {}).get("certificate")
     if not cert:
-        raise RuntimeError(f"Tạo SSL: không thấy trường 'certificate' trong phản hồi: {data}")
+        raise RuntimeError(f"Tạo SSL: không thấy 'certificate' trong phản hồi: {data}")
+
     return {"certificate": cert, "private_key": private_key_pem}
 
 # =========================
@@ -249,7 +269,7 @@ async def process_row(session, row: dict) -> dict:
 # =========================
 START_TEXT = (
     "Gửi Excel (.xlsx): domain, ip_server, cloudflare_token.\n"
-    "Quy trình: KIỂM TRA/THÊM ZONE → XOÁ TẤT CẢ RECORD → THÊM A @ & CNAME www → LẤY NAMESERVER → TẠO ORIGIN CA (RSA/10y)."
+    "Quy trình: KIỂM TRA/THÊM ZONE → XOÁ TẤT CẢ RECORD → THÊM A @ & CNAME www → LẤY NAMESERVER → TẠO ORIGIN CA (RSA/5475 ngày)."
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
