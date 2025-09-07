@@ -12,7 +12,6 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import aiohttp
 import zipfile
-import time
 
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -66,7 +65,7 @@ async def find_zone(session, token, domain: str):
     return None, None
 
 async def create_zone(session, token, domain: str):
-    # luôn kèm account.id
+    # Luôn kèm account.id để tạo zone trong account hiện tại
     acct_id = (await get_accounts(session, token))[0]["id"]
     payload = {"name": domain, "type": "full", "jump_start": False, "account": {"id": acct_id}}
     st, data = await cf(session, "POST", f"{CF_API}/zones", token, data=json.dumps(payload))
@@ -113,16 +112,14 @@ async def delete_all_dns_records(session, token, zone_id: str) -> int:
             raise RuntimeError(f"Xoá record {rid} thất bại ({st}): {data}")
         deleted += 1
         await asyncio.sleep(0.05)
-    # verify
+    # verify empty
     left = await list_dns_records(session, token, zone_id)
     if left:
-        # còn sót => báo chi tiết để debug
         names = [f"{x['type']} {x['name']}" for x in left]
         raise RuntimeError(f"Vẫn còn DNS chưa xoá: {', '.join(names)[:300]}")
     return deleted
 
 async def create_a_apex(session, token, zone_id: str, domain: str, ip: str):
-    # Cloudflare API yêu cầu 'name' là FQDN tại apex (vd: example.com)
     payload = {"type": "A", "name": domain, "content": ip, "ttl": 1, "proxied": False}
     st, data = await cf(session, "POST", f"{CF_API}/zones/{zone_id}/dns_records", token, data=json.dumps(payload))
     if st not in (200, 201):
@@ -138,7 +135,7 @@ async def create_cname_www(session, token, zone_id: str, domain: str):
 
 # ========== Origin CA (SSL) ==========
 async def create_origin_cert(session, token, domain: str):
-    # ĐÚNG ENDPOINT: /certificates (Origin CA API, không theo zone)
+    # Endpoint đúng của Origin CA: KHÔNG theo /zones
     payload = {
         "hostnames": [domain, f"*.{domain}"],
         "request_type": "origin-rsa",
@@ -149,7 +146,7 @@ async def create_origin_cert(session, token, domain: str):
         raise RuntimeError(f"Tạo SSL thất bại ({st}): {data}")
     return data["result"]
 
-# ========== Per-row ==========
+# ========== Per-row: đúng thứ tự yêu cầu ==========
 async def process_row(session, row: dict) -> dict:
     domain_raw = str(row.get("domain", "")).strip()
     ip_raw = str(row.get("ip_server", "")).strip()
@@ -165,26 +162,17 @@ async def process_row(session, row: dict) -> dict:
         return {"domain": domain, "ok": False, "error": str(e)}
 
     try:
-        # 1) find or create zone
+        # 1) ADD ZONE (find or create)
         zone_id, zone_obj = await find_zone(session, token, domain)
         if not zone_id:
             zone_id, zone_obj = await create_zone(session, token, domain)
 
-        # chờ zone khả dụng tối thiểu (một số account cần vài giây)
-        for _ in range(6):
-            try:
-                _ = await list_dns_records(session, token, zone_id)
-                break
-            except Exception:
-                await asyncio.sleep(1.0)
-
-        # 2) delete all & verify
+        # 2) DELETE ALL RECORDS (verify empty)
         await delete_all_dns_records(session, token, zone_id)
 
-        # 3) create A @ and CNAME www & verify
+        # 3) ADD RECORDS (A @, CNAME www) + verify
         a_id = await create_a_apex(session, token, zone_id, domain, ip)
         c_id = await create_cname_www(session, token, zone_id, domain)
-        # verify presence
         cur = await list_dns_records(session, token, zone_id)
         need = {("A", domain), ("CNAME", f"www.{domain}")}
         have = {(x["type"], x["name"]) for x in cur}
@@ -192,12 +180,12 @@ async def process_row(session, row: dict) -> dict:
         if missing:
             raise RuntimeError(f"Bản ghi thiếu sau khi tạo: {missing}")
 
-        # 4) Origin CA cert
-        cert_obj = await create_origin_cert(session, token, domain)
-
-        # 5) nameservers
+        # 4) GET NAMESERVERS
         zone_obj = await get_zone(session, token, zone_id)
         ns_list = extract_nameservers(zone_obj)
+
+        # 5) CREATE SSL (Origin CA)
+        cert_obj = await create_origin_cert(session, token, domain)
 
         return {
             "domain": domain,
@@ -214,9 +202,8 @@ async def process_row(session, row: dict) -> dict:
 
 # ========== Telegram ==========
 START_TEXT = (
-    "Gửi Excel (.xlsx) gồm: domain, ip_server, cloudflare_token.\n"
-    "Bot sẽ tạo/tìm zone, XOÁ toàn bộ DNS hiện có (có verify), tạo A @ & CNAME www (có verify), "
-    "tạo Origin CA (RSA/10y), trả về Nameservers + Private Key + Certificate + ZIP."
+    "Gửi Excel (.xlsx): domain, ip_server, cloudflare_token.\n"
+    "Quy trình: ADD ZONE → XOÁ TOÀN BỘ RECORD → THÊM RECORD → LẤY NAMESERVER → TẠO SSL (Origin CA)."
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -286,7 +273,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
-                # ZIP
+                # Gửi ZIP key + cert
                 zip_buffer = BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w") as z:
                     z.writestr(f"{res['domain']}.key", priv_key)
