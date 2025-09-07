@@ -162,22 +162,24 @@ async def process_row(session, row: dict) -> dict:
         return {"domain": domain, "ok": False, "error": str(e)}
 
     try:
-        # find-or-create zone
+        # 1. Tìm zone có sẵn
         zone_id, nameservers = await find_zone_by_name(session, token, domain)
         if not zone_id:
+            # 2. Nếu chưa có thì tạo mới
             zone_id, nameservers_init = await create_zone(session, token, domain)
             zone = await get_zone(session, token, zone_id)
             nameservers = zone.get("name_servers", nameservers_init) or nameservers_init
         else:
+            # 3. Nếu có rồi thì lấy lại nameserver
             zone = await get_zone(session, token, zone_id)
             nameservers = zone.get("name_servers", nameservers) or nameservers
 
-        # DNS reset
+        # 4. Reset DNS
         await delete_all_dns_records(session, token, zone_id)
         await create_a_record(session, token, zone_id, domain, ip)
         await create_cname_www(session, token, zone_id, domain)
 
-        # SSL
+        # 5. SSL
         cert_data = await create_origin_cert(session, token, zone_id, domain)
         certificate = cert_data.get("certificate", "")
         private_key = cert_data.get("private_key", "")
