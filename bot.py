@@ -1,4 +1,3 @@
-\
 import asyncio
 import os
 import re
@@ -19,6 +18,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 
+
 # -------- Utilities --------
 def normalize_domain(d: str) -> str:
     d = (d or "").strip().strip(".").lower()
@@ -26,12 +26,14 @@ def normalize_domain(d: str) -> str:
     d = d.split("/")[0]
     return d
 
+
 def validate_ipv4(ip: str) -> str:
     ip = (ip or "").strip()
     try:
         return str(ipaddress.IPv4Address(ip))
     except Exception:
         raise ValueError(f"IPv4 không hợp lệ: {ip!r}")
+
 
 async def cf_request(session: aiohttp.ClientSession, method: str, url: str, token: str, **kwargs):
     headers = kwargs.pop("headers", {})
@@ -44,6 +46,7 @@ async def cf_request(session: aiohttp.ClientSession, method: str, url: str, toke
         except Exception:
             data = {"raw": text}
         return resp.status, data
+
 
 # ---- Zone helpers ----
 async def find_zone_by_name(session, token, domain: str):
@@ -60,11 +63,11 @@ async def find_zone_by_name(session, token, domain: str):
         return z["id"], z.get("name_servers", [])
     return None, []
 
+
 async def create_zone(session, token, domain: str):
     payload = {"name": domain, "type": "full", "jump_start": False}
     status, data = await cf_request(session, "POST", f"{CF_API_BASE}/zones", token, data=json.dumps(payload))
     if status == 400 and isinstance(data, dict) and data.get("errors"):
-        # try with account id
         alt_status, accounts = await cf_request(session, "GET", f"{CF_API_BASE}/accounts", token)
         if alt_status == 200 and isinstance(accounts, dict) and accounts.get("result"):
             acct_id = accounts["result"][0]["id"]
@@ -75,11 +78,13 @@ async def create_zone(session, token, domain: str):
     zone = data["result"]
     return zone["id"], zone.get("name_servers", [])
 
+
 async def get_zone(session, token, zone_id: str):
     status, data = await cf_request(session, "GET", f"{CF_API_BASE}/zones/{zone_id}", token)
     if status != 200:
         raise RuntimeError(f"Get zone thất bại ({status}): {data}")
     return data["result"]
+
 
 # ---- DNS helpers ----
 async def delete_all_dns_records(session, token, zone_id: str):
@@ -106,12 +111,14 @@ async def delete_all_dns_records(session, token, zone_id: str):
         await cf_request(session, "DELETE", f"{CF_API_BASE}/zones/{zone_id}/dns_records/{rid}", token)
     return len(to_delete)
 
+
 async def create_a_record(session, token, zone_id: str, domain: str, ip: str):
     payload = {"type": "A", "name": domain, "content": ip, "ttl": 1, "proxied": False}
     status, data = await cf_request(session, "POST", f"{CF_API_BASE}/zones/{zone_id}/dns_records", token, data=json.dumps(payload))
     if status not in (200, 201):
         raise RuntimeError(f"Tạo A record thất bại ({status}): {data}")
     return data["result"]["id"]
+
 
 async def create_cname_www(session, token, zone_id: str, target_domain: str):
     payload = {"type": "CNAME", "name": "www", "content": target_domain, "ttl": 1, "proxied": False}
@@ -120,26 +127,9 @@ async def create_cname_www(session, token, zone_id: str, target_domain: str):
         raise RuntimeError(f"Tạo CNAME www thất bại ({status}): {data}")
     return data["result"]["id"]
 
-async def set_free_plan_if_possible(session, token, zone_id: str):
-    status, plans = await cf_request(session, "GET", f"{CF_API_BASE}/zones/{zone_id}/available_plans", token)
-    if status != 200:
-        return "skip"
-    free_id = None
-    for p in plans.get("result", []):
-        if (p.get("legacy_id") == "free") or (str(p.get("name", "")).lower() == "free"):
-            free_id = p["id"]
-            break
-    if not free_id:
-        return "not_found"
-    payload = {"rate_plan": {"id": free_id}}
-    status, _ = await cf_request(session, "PUT", f"{CF_API_BASE}/zones/{zone_id}/subscription", token, data=json.dumps(payload))
-    if status not in (200, 201):
-        return "failed"
-    return "ok"
 
 # ---- SSL helpers ----
 async def create_origin_cert(session, token, zone_id, domain: str):
-    # Origin Client Certificate (RSA 10y)
     payload = {
         "hostnames": [domain, f"*.{domain}"],
         "request_type": "origin-rsa",
@@ -147,13 +137,14 @@ async def create_origin_cert(session, token, zone_id, domain: str):
     }
     status, data = await cf_request(
         session, "POST",
-        f"{CF_API_BASE}/zones/{zone_id}/origin_tls_client_auth/hostnames/certificates",
+        f"{CF_API_BASE}/zones/{zone_id}/origin_ca/certificates",  # ✅ đúng endpoint
         token,
         data=json.dumps(payload)
     )
     if status not in (200, 201):
         raise RuntimeError(f"Tạo SSL thất bại ({status}): {data}")
-    return data["result"]  # certificate, private_key, expires_on
+    return data["result"]
+
 
 # ---- Main per-row flow ----
 async def process_row(session, row: dict) -> dict:
@@ -173,14 +164,11 @@ async def process_row(session, row: dict) -> dict:
     try:
         # find-or-create zone
         zone_id, nameservers = await find_zone_by_name(session, token, domain)
-        created = False
         if not zone_id:
             zone_id, nameservers_init = await create_zone(session, token, domain)
-            created = True
             zone = await get_zone(session, token, zone_id)
             nameservers = zone.get("name_servers", nameservers_init) or nameservers_init
         else:
-            # refresh nameservers
             zone = await get_zone(session, token, zone_id)
             nameservers = zone.get("name_servers", nameservers) or nameservers
 
@@ -188,11 +176,6 @@ async def process_row(session, row: dict) -> dict:
         await delete_all_dns_records(session, token, zone_id)
         await create_a_record(session, token, zone_id, domain, ip)
         await create_cname_www(session, token, zone_id, domain)
-
-        # plan if new
-        plan_status = "skip"
-        if created:
-            plan_status = await set_free_plan_if_possible(session, token, zone_id)
 
         # SSL
         cert_data = await create_origin_cert(session, token, zone_id, domain)
@@ -203,24 +186,26 @@ async def process_row(session, row: dict) -> dict:
             "domain": domain,
             "ok": True,
             "nameservers": nameservers,
-            "plan": plan_status,
             "certificate": certificate,
             "private_key": private_key,
             "error": ""
         }
     except Exception as e:
-        return {"domain": domain, "ok": False, "error": str(e), "nameservers": [], "plan": "skip"}
+        return {"domain": domain, "ok": False, "error": str(e), "nameservers": [], "certificate": "", "private_key": ""}
+
 
 # -------- Telegram Handlers --------
 START_TEXT = (
     "Gửi file Excel (.xlsx): domain, ip_server, cloudflare_token.\n"
-    "- Nếu zone đã có: bot chỉ reset DNS, tạo bản ghi mới, tạo SSL và trả về key/cert.\n"
-    "- Nếu zone chưa có: bot tạo zone rồi làm các bước trên.\n"
-    "- Mỗi domain gửi ZIP (key+cert) và tổng hợp báo cáo .xlsx."
+    "- Nếu zone đã có: bot sẽ reset DNS, tạo record mới, tạo SSL.\n"
+    "- Nếu chưa có: bot sẽ tạo zone rồi làm các bước trên.\n"
+    "- Bot trả về Nameservers + Private Key + Certificate + file ZIP."
 )
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(START_TEXT)
+
 
 def build_report(results):
     rows = []
@@ -231,15 +216,15 @@ def build_report(results):
             "status": "success" if r.get("ok") else "failed",
             "nameserver_1": ns[0] if len(ns) >= 1 else "",
             "nameserver_2": ns[1] if len(ns) >= 2 else "",
-            "plan_status": r.get("plan", ""),
             "error": r.get("error", "")
         })
-    df = pd.DataFrame(rows, columns=["domain", "status", "nameserver_1", "nameserver_2", "plan_status", "error"])
+    df = pd.DataFrame(rows, columns=["domain", "status", "nameserver_1", "nameserver_2", "error"])
     bio = BytesIO()
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="report")
     bio.seek(0)
     return bio
+
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -262,7 +247,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df.columns = [str(c).strip().lower() for c in df.columns]
     required = {"domain", "ip_server", "cloudflare_token"}
     if not required.issubset(set(df.columns)):
-        await update.message.reply_text("Thiếu cột bắt buộc. Cần đủ: domain, ip_server, cloudflare_token")
+        await update.message.reply_text("Thiếu cột: domain, ip_server, cloudflare_token")
         return
 
     results = []
@@ -274,11 +259,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if res.get("ok"):
                 ns_list = res.get("nameservers") or []
-                ns_msg = "\n".join([f"- {ns}" for ns in ns_list[:2]]) if ns_list else "(Cloudflare chưa trả NS)"
+                ns_msg = "\n".join([f"- {ns}" for ns in ns_list[:2]]) if ns_list else "(chưa có NS)"
                 priv_key = res.get("private_key", "")
                 cert = res.get("certificate", "")
 
-                # HTML code blocks for copy
                 msg = (
                     f"✅ <b>{res['domain']}</b>\n"
                     f"<b>Nameservers:</b>\n{ns_msg}\n\n"
@@ -287,7 +271,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
-                # Send ZIP with key+cert
+                # gửi ZIP
                 zip_buffer = BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w") as z:
                     z.writestr(f"{res['domain']}.key", priv_key)
@@ -317,6 +301,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fail_count = len(results) - ok_count
     await update.message.reply_text(f"Hoàn tất. Thành công: {ok_count} | Thất bại: {fail_count}")
 
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("Thiếu TELEGRAM_BOT_TOKEN trong .env")
@@ -325,6 +310,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     print("Bot started.")
     app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
