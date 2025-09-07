@@ -19,7 +19,9 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
 
 
-# -------- Utilities --------
+# =========================
+# Helpers
+# =========================
 def normalize_domain(d: str) -> str:
     d = (d or "").strip().strip(".").lower()
     d = re.sub(r"^https?://", "", d)
@@ -48,7 +50,17 @@ async def cf_request(session: aiohttp.ClientSession, method: str, url: str, toke
         return resp.status, data
 
 
-# ---- Zone helpers ----
+# ----- Zone
+async def get_accounts(session, token):
+    status, data = await cf_request(session, "GET", f"{CF_API_BASE}/accounts", token)
+    if status != 200:
+        raise RuntimeError(f"Lấy accounts thất bại ({status}): {data}")
+    res = data.get("result") or []
+    if not res:
+        raise RuntimeError("Không có account nào cho token này.")
+    return res  # list dicts
+
+
 async def find_zone_by_name(session, token, domain: str):
     status, data = await cf_request(
         session, "GET",
@@ -60,23 +72,22 @@ async def find_zone_by_name(session, token, domain: str):
     result = data.get("result", [])
     if result:
         z = result[0]
-        return z["id"], z.get("name_servers", [])
-    return None, []
+        return z["id"], z
+    return None, None
 
 
 async def create_zone(session, token, domain: str):
-    payload = {"name": domain, "type": "full", "jump_start": False}
+    # luôn kèm account.id để Cloudflare tạo zone trên account hiện tại
+    accounts = await get_accounts(session, token)
+    account_id = accounts[0]["id"]
+
+    payload = {"name": domain, "type": "full", "jump_start": False, "account": {"id": account_id}}
     status, data = await cf_request(session, "POST", f"{CF_API_BASE}/zones", token, data=json.dumps(payload))
-    if status == 400 and isinstance(data, dict) and data.get("errors"):
-        alt_status, accounts = await cf_request(session, "GET", f"{CF_API_BASE}/accounts", token)
-        if alt_status == 200 and isinstance(accounts, dict) and accounts.get("result"):
-            acct_id = accounts["result"][0]["id"]
-            payload = {"name": domain, "type": "full", "jump_start": False, "account": {"id": acct_id}}
-            status, data = await cf_request(session, "POST", f"{CF_API_BASE}/zones", token, data=json.dumps(payload))
     if status not in (200, 201):
+        # 1061: already exists (thường là zone đã tồn tại ở account khác hoặc pending transfer)
         raise RuntimeError(f"Create zone thất bại ({status}): {data}")
     zone = data["result"]
-    return zone["id"], zone.get("name_servers", [])
+    return zone["id"], zone
 
 
 async def get_zone(session, token, zone_id: str):
@@ -86,7 +97,13 @@ async def get_zone(session, token, zone_id: str):
     return data["result"]
 
 
-# ---- DNS helpers ----
+def extract_nameservers(zone_obj: dict):
+    # Ưu tiên vanity_name_servers (nếu có, thường cho plan cao)
+    ns = zone_obj.get("vanity_name_servers") or zone_obj.get("name_servers") or []
+    return list(ns)
+
+
+# ----- DNS
 async def delete_all_dns_records(session, token, zone_id: str):
     page = 1
     per_page = 5000
@@ -128,7 +145,7 @@ async def create_cname_www(session, token, zone_id: str, target_domain: str):
     return data["result"]["id"]
 
 
-# ---- SSL helpers ----
+# ----- Origin SSL
 async def create_origin_cert(session, token, zone_id, domain: str):
     payload = {
         "hostnames": [domain, f"*.{domain}"],
@@ -137,7 +154,7 @@ async def create_origin_cert(session, token, zone_id, domain: str):
     }
     status, data = await cf_request(
         session, "POST",
-        f"{CF_API_BASE}/zones/{zone_id}/origin_ca/certificates",  # ✅ đúng endpoint
+        f"{CF_API_BASE}/zones/{zone_id}/origin_ca/certificates",
         token,
         data=json.dumps(payload)
     )
@@ -146,7 +163,9 @@ async def create_origin_cert(session, token, zone_id, domain: str):
     return data["result"]
 
 
-# ---- Main per-row flow ----
+# =========================
+# Per-row workflow
+# =========================
 async def process_row(session, row: dict) -> dict:
     domain_raw = str(row.get("domain", "")).strip()
     ip_raw = str(row.get("ip_server", "")).strip()
@@ -162,24 +181,21 @@ async def process_row(session, row: dict) -> dict:
         return {"domain": domain, "ok": False, "error": str(e)}
 
     try:
-        # 1. Tìm zone có sẵn
-        zone_id, nameservers = await find_zone_by_name(session, token, domain)
+        # 1) find zone; if not found -> create with account.id
+        zone_id, zone_obj = await find_zone_by_name(session, token, domain)
         if not zone_id:
-            # 2. Nếu chưa có thì tạo mới
-            zone_id, nameservers_init = await create_zone(session, token, domain)
-            zone = await get_zone(session, token, zone_id)
-            nameservers = zone.get("name_servers", nameservers_init) or nameservers_init
-        else:
-            # 3. Nếu có rồi thì lấy lại nameserver
-            zone = await get_zone(session, token, zone_id)
-            nameservers = zone.get("name_servers", nameservers) or nameservers
+            zone_id, zone_obj = await create_zone(session, token, domain)
 
-        # 4. Reset DNS
+        # always refresh zone info to read nameservers
+        zone_obj = await get_zone(session, token, zone_id)
+        ns_list = extract_nameservers(zone_obj)
+
+        # 2) reset DNS + add required records
         await delete_all_dns_records(session, token, zone_id)
         await create_a_record(session, token, zone_id, domain, ip)
         await create_cname_www(session, token, zone_id, domain)
 
-        # 5. SSL
+        # 3) create origin certificate
         cert_data = await create_origin_cert(session, token, zone_id, domain)
         certificate = cert_data.get("certificate", "")
         private_key = cert_data.get("private_key", "")
@@ -187,21 +203,23 @@ async def process_row(session, row: dict) -> dict:
         return {
             "domain": domain,
             "ok": True,
-            "nameservers": nameservers,
+            "nameservers": ns_list,
             "certificate": certificate,
             "private_key": private_key,
             "error": ""
         }
+
     except Exception as e:
         return {"domain": domain, "ok": False, "error": str(e), "nameservers": [], "certificate": "", "private_key": ""}
 
 
-# -------- Telegram Handlers --------
+# =========================
+# Telegram handlers
+# =========================
 START_TEXT = (
     "Gửi file Excel (.xlsx): domain, ip_server, cloudflare_token.\n"
-    "- Nếu zone đã có: bot sẽ reset DNS, tạo record mới, tạo SSL.\n"
-    "- Nếu chưa có: bot sẽ tạo zone rồi làm các bước trên.\n"
-    "- Bot trả về Nameservers + Private Key + Certificate + file ZIP."
+    "- Bot sẽ: tìm/tạo zone (kèm account.id), xoá DNS cũ, thêm A @ và CNAME www,\n"
+    "  tạo Origin CA cert (RSA-10y), rồi trả về Nameserver + Private Key + Certificate + ZIP."
 )
 
 
@@ -234,7 +252,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Vui lòng gửi file Excel .xlsx")
         return
 
-    await update.message.reply_text("Đang xử lý file, vui lòng đợi…")
+    await update.message.reply_text("Đang xử lý file…")
 
     file = await doc.get_file()
     file_bytes = await file.download_as_bytearray()
@@ -254,7 +272,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     results = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180)) as session:
-        for idx, row in df.iterrows():
+        for _, row in df.iterrows():
             row_dict = {k: ("" if pd.isna(v) else str(v)) for k, v in row.items()}
             res = await process_row(session, row_dict)
             results.append(res)
@@ -273,7 +291,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
-                # gửi ZIP
+                # gửi ZIP key + cert
                 zip_buffer = BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w") as z:
                     z.writestr(f"{res['domain']}.key", priv_key)
@@ -288,14 +306,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(
                     f"❌ {res.get('domain','(n/a)')} - Lỗi: {res.get('error')}"
                 )
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
 
     report_io = build_report(results)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"cloudflare_report_{ts}.xlsx"
     await update.message.reply_document(
         document=report_io,
-        filename=filename,
+        filename=f"cloudflare_report_{ts}.xlsx",
         caption=f"Báo cáo Cloudflare ({ts})"
     )
 
