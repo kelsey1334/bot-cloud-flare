@@ -147,20 +147,21 @@ async def create_cname_www(session, token, zone_id: str, target_domain: str):
 
 # ----- Origin SSL
 async def create_origin_cert(session, token, zone_id, domain: str):
+    # zone_id không dùng ở đây (endpoint không theo zone)
     payload = {
         "hostnames": [domain, f"*.{domain}"],
         "request_type": "origin-rsa",
-        "requested_validity": 3650
+        "requested_validity": 3650  # 10 năm
     }
     status, data = await cf_request(
         session, "POST",
-        f"{CF_API_BASE}/zones/{zone_id}/origin_ca/certificates",
+        f"{CF_API_BASE}/certificates",   # ✅ endpoint đúng
         token,
         data=json.dumps(payload)
     )
     if status not in (200, 201):
         raise RuntimeError(f"Tạo SSL thất bại ({status}): {data}")
-    return data["result"]
+    return data["result"]  # chứa certificate + private_key
 
 
 # =========================
